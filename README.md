@@ -61,8 +61,8 @@ gunicorn -w 4 -b 0.0.0.0:8000 main:app
 
 ### 5. 公開URLを使ってWebhookを設定（LINE Developers）
 
-Webhook URL: https://yourdomain.com/callback（ngrokや本番サーバー）
-Webhook送信: 有効にする
+- Webhook URL: https://yourdomain.com/callback (ngrokや本番サーバー)
+- Webhook送信: 有効にする
 
 ## コマンド一覧
  
