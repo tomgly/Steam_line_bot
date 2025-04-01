@@ -1,86 +1,167 @@
 import os
+import hmac
+import hashlib
+import base64
+import json
 import requests
 from flask import Flask, request, abort
 from dotenv import load_dotenv
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.v3.messaging import (
+    MessagingApi, Configuration, ApiClient,
+    TextMessage, ReplyMessageRequest
+)
+from google import genai
 
-# .envから環境変数を読み込み
 load_dotenv()
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET").encode("utf-8")
 ITAD_API_KEY = os.getenv("ITAD_API_KEY")
+STEAM_API_KEY = os.getenv("STEAM_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# LINE・Flask 設定
+configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 app = Flask(__name__)
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ゲーム名からIsThereAnyDealのplain（slug）を取得
-def get_plain_from_title(game_title):
-    url = "https://api.isthereanydeal.com/v02/search/search/"
-    params = {
-        "key": ITAD_API_KEY,
-        "q": game_title,
-    }
-    res = requests.get(url, params=params).json()
+# タイトルを英語にGeminiで補正
+def predict_english_title(user_input):
+    prompt = f"""
+    ユーザーが「{user_input}」と入力しました。
+    これはSteam上に存在するゲームタイトル（日本語・英語・略語・誤字含む）だと考えられます。
+    最も一致するSteamの正式な英語ゲームタイトルを1つだけ出力してください。
+    出力はタイトルのみ、余計な説明は不要です。
+    """
+
     try:
-        return res["data"]["results"][0]["plain"]
-    except:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-001', contents=prompt
+        )
+        print("Gemini API応答:", response.text.strip())
+        return response.text.strip()
+    except Exception as e:
+        print("Gemini APIエラー:", e)
         return None
 
-# plainから価格情報を取得
-def get_price_info(plain):
-    url = "https://api.isthereanydeal.com/v01/game/prices/"
+
+# ITADのplainを取得
+def get_game_id_from_title(title):
+    url = "https://api.isthereanydeal.com/games/search/v1"
+    params = {"key": ITAD_API_KEY, "title": title, "results": 1}
+    try:
+        res = requests.get(url, params=params)
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        if data and len(data) > 0:
+            # idを返す
+            return data[0]["id"]
+        return None
+    except Exception as e:
+        print(f"エラーが発生しました: {e}")
+        return None
+
+
+# ゲームの価格情報を取得する関数
+def get_price_info(game_id):
+    url = "https://api.isthereanydeal.com/games/prices/v3"
     params = {
         "key": ITAD_API_KEY,
-        "plains": plain,
-        "region": "us",
-        "country": "US"
+        "country": "JP",
+        "shops": 61 # Steam
     }
-    res = requests.get(url, params=params).json()
+    payload = [game_id]
+
     try:
-        price_data = res["data"][plain]["list"][0]
-        shop = price_data["shop"]["name"]
-        price = price_data["price_new"]
-        cut = price_data["price_cut"]
-        url = price_data["url"]
-        return f"現在の最安値：${price:.2f}（{shop}）\n割引率：{cut}%オフ\nリンク：{url}"
-    except:
-        return "価格情報が見つかりませんでした。"
+        res = requests.post(url, params=params, json=payload)
+        if res.status_code != 200:
+            return f"価格情報の取得に失敗しました。ステータスコード: {res.status_code}"
+        
+        data = res.json()
+        if not data or len(data) == 0:
+            return "価格情報が見つかりませんでした。"
 
-# ユーザーからのメッセージを処理
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    msg = event.message.text
+        game_data = data[0]
 
-    if msg.startswith("!価格 "):
-        game_title = msg[4:].strip()
-        plain = get_plain_from_title(game_title)
+        # 現在の価格情報
+        deals = game_data.get("deals", [])
+        if deals:
+            deal = deals[0]
+            current_price = int(deal["price"]["amount"])
+            regular_price = int(deal["regular"]["amount"])
+            cut = deal.get("cut", 0)
+            url = deal.get("url", "リンクなし")
 
-        if not plain:
-            reply = f"「{game_title}」は見つかりませんでした。"
+            result = f"価格: ¥{current_price}（通常価格: ¥{regular_price}）\n"
+            result += f"割引率: {cut}%\n"
+            result += f"リンク: {url}\n"
         else:
-            price_info = get_price_info(plain)
-            reply = f"【{game_title}】の価格情報：\n{price_info}"
+            result += "\n現在価格情報が取得できませんでした。"
 
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply)
-        )
+        # 過去最安値
+        if game_data.get("historyLow") and "all" in game_data["historyLow"]:
+            history = game_data["historyLow"]["all"]
+            result += f"\n【過去最安値】¥{int(history['amount'])}"
 
-# Webhookエンドポイント
+        return result.strip()
+    
+    except Exception as e:
+        print(f"価格情報取得エラー: {e}")
+        return "価格情報の取得中にエラーが発生しました。"
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    print("Webhook受信")
     body = request.get_data(as_text=True)
+    signature = request.headers.get("X-Line-Signature")
 
-    try:
-        handler.handle(body, signature)
-    except:
+    # 署名チェック
+    hash = hmac.new(LINE_CHANNEL_SECRET, body.encode("utf-8"), hashlib.sha256).digest()
+    computed_signature = base64.b64encode(hash).decode()
+    if computed_signature != signature:
         abort(400)
 
-    return "OK"
+    events = json.loads(body).get("events", [])
 
-# アプリ起動
-if __name__ == "__main__":
-    app.run(port=8000)
+    for event in events:
+        if event["type"] == "message" and event["message"]["type"] == "text":
+            text = event["message"]["text"]
+            reply_token = event["replyToken"]
+
+            # 「こんにちは」に反応
+            if text == "こんにちは":
+                reply = "こんにちは！"
+
+            # /価格 コマンド
+            elif text.startswith("/価格 "):
+                title = text[4:].strip()
+                new_title = predict_english_title(title)
+                if not new_title:
+                    reply = f"「{title}」は見つかりませんでした。"
+                else:
+                    id = get_game_id_from_title(new_title)
+                    reply = f"【{new_title}】の価格情報\n\n{get_price_info(id)}"
+
+            elif text.startswith("/"):
+                reply = "コマンドが分かりませんでした\n /価格 ゲーム名 を試してみてね"
+
+            else:
+                # 無視（返信しない）
+                print("無視しました")
+                return "OK"
+
+            try:
+                with ApiClient(configuration) as api_client:
+                    messaging_api = MessagingApi(api_client)
+                    messaging_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=reply_token,
+                            messages=[TextMessage(text=reply)]
+                        )
+                    )
+            except Exception as e:
+                print("返信エラー:", e)
+
+    return "OK"
